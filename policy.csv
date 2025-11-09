@@ -1,0 +1,12 @@
+# --- Role Definitions (Who is what, and where?) ---
+# format: g, user_id, role_name, clinic_id (domain)
+g, user-jane, clinic_doctor, clinic-abc
+g, user-joe, clinic_manager, clinic-abc
+g, user-sara, clinic_doctor, clinic-xyz
+
+# --- Policy Definitions (What can roles do, and where?) ---
+# format: p, role_name, clinic_id (domain), resource, action
+p, clinic_doctor, clinic-abc, patient_data, read
+p, clinic_manager, clinic-abc, patient_data, read
+p, clinic_manager, clinic-abc, patient_data, write
+p, clinic_doctor, clinic-xyz, patient_data, read
