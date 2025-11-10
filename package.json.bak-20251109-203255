@@ -8,10 +8,12 @@
     "dev": "nodemon index.js"
   },
   "license": "MIT",
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "casbin": "^5.38.0",
-    "casbin-pg-adapter": "1.4.0",
+    "casbin-pg-adapter": "^1.4.1",
     "dotenv": "^16.4.5",
     "express": "^4.18.2",
     "express-jwt": "^8.4.1",
