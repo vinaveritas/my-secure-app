@@ -1,1 +1,98 @@
-# (paste the full ci.yml content I gave you earlier here)
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-api:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -h localhost"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    env:
+      NODE_ENV: test
+      PORT: 8080
+      JWT_SECRET: ci-secret
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: vinaveritas_db
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install deps
+        run: npm ci || npm install
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..60}; do
+            pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" && break
+            sleep 1
+          done
+
+      - name: Create DB (idempotent)
+        run: |
+          # Create the database; if it already exists, ignore the error.
+          PGPASSWORD="$PGPASSWORD" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -v ON_ERROR_STOP=0 -c "CREATE DATABASE $PGDATABASE;" || true
+
+      - name: Run migrations
+        run: |
+          set -euo pipefail
+          for f in migrations/*.sql; do
+            echo "Applying $f"
+            PGPASSWORD="$PGPASSWORD" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Verify schema
+        run: |
+          set -euo pipefail
+          PGPASSWORD="$PGPASSWORD" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -v ON_ERROR_STOP=1 -c "\dt"
+          PGPASSWORD="$PGPASSWORD" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -v ON_ERROR_STOP=1 -c "SELECT relname FROM pg_class WHERE relname IN ('casbin_rule','patients');"
+
+      - name: Seed dev data (if present)
+        run: |
+          if ls seeds/dev/*.sql 1> /dev/null 2>&1; then
+            for f in seeds/dev/*.sql; do
+              echo "Seeding $f"
+              PGPASSWORD="$PGPASSWORD" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -v ON_ERROR_STOP=1 -f "$f"
+            done
+          else
+            echo "No seeds found; skipping."
+          fi
+
+      - name: Start API (background)
+        run: |
+          node index.js &
+          echo $! > server.pid
+          sleep 3
+
+      - name: Health check
+        run: |
+          curl -fsS "http://localhost:$PORT/healthz"
+          echo "Health OK"
+
+      - name: Stop API
+        if: always()
+        run: |
+          if [ -f server.pid ]; then kill "$(cat server.pid)" || true; fi
