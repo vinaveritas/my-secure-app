@@ -81,7 +81,7 @@ jobs:
           set -euo pipefail
           PGPASSWORD="$PGPASSWORD" psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -v ON_ERROR_STOP=1 -c "
             \dt
-            SELECT 'has_casbin' AS check, COUNT(*)>0 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE relname='casbin_rule' AND n.nspname='public';
+            SELECT 'has_casbin'  AS check, COUNT(*)>0 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE relname='casbin_rule' AND n.nspname='public';
             SELECT 'has_patients' AS check, COUNT(*)>0 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE relname='patients' AND n.nspname='public';
           "
 
