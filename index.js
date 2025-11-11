@@ -1,4 +1,4 @@
-/* --- VinaVeritas Nexus API (Phase 0: complete + soft-delete + robust adapter) --- */
+/* --- VinaVeritas Nexus API (Phase 0: soft-delete, no hard delete) --- */
 require('dotenv').config();
 const express = require('express');
 const { newEnforcer } = require('casbin');
@@ -24,7 +24,7 @@ const dbPool = new Pool(dbOptions);
 
 /* 3) Casbin adapter (robust import shapes) */
 async function createCasbinPgAdapter(pool) {
-  const mod = require('casbin-pg-adapter'); // 1.4.x compatible
+  const mod = require('casbin-pg-adapter'); // works with 1.4.x
   if (typeof mod?.newAdapter === 'function') {
     console.log('casbin-pg-adapter: using mod.newAdapter(options)');
     return await mod.newAdapter({ pool });
@@ -33,7 +33,9 @@ async function createCasbinPgAdapter(pool) {
     console.log('casbin-pg-adapter: using mod.default.newAdapter(options)');
     return await mod.default.newAdapter({ pool });
   }
-  throw new Error(`Unsupported casbin-pg-adapter export shape. Keys: ${Object.keys(mod).join(', ')}`);
+  throw new Error(
+    `Unsupported casbin-pg-adapter export shape. Keys: ${Object.keys(mod).join(', ')}`
+  );
 }
 
 /* 4) Helpers */
@@ -43,18 +45,6 @@ async function requireAccess(enforcer, sub, dom, obj, act) {
   return enforcer.enforce(sub, dom, obj, act);
 }
 
-/* HATEOAS demo builder (kept from earlier versions) */
-async function buildLinks(enforcer, userId, clinicId) {
-  const patientResource = 'patient_data';
-  const _links = { self: { href: `/api/v6/patients/${clinicId}/patient-xyz` } };
-  const canRead = await enforcer.enforce(userId, clinicId, patientResource, 'read');
-  const canWrite = await enforcer.enforce(userId, clinicId, patientResource, 'write');
-  if (canRead) _links.read_charts = { href: `/api/v6/patients/${clinicId}/patient-xyz/charts` };
-  if (canWrite) _links.write_charts = { href: `/api/v6/patients/${clinicId}/patient-xyz/charts`, method: 'POST' };
-  return _links;
-}
-
-/* Validation helpers */
 function validateDob(dob) {
   if (dob === undefined || dob === null || dob === '') return null; // optional
   const d = new Date(dob);
@@ -66,7 +56,7 @@ function validateDob(dob) {
 
 function validatePatientPayload(body, isCreate = true) {
   const errors = [];
-  const { name, species, breed, dob, status } = body || {};
+  const { name, species, breed, dob, archived } = body || {};
 
   if (isCreate) {
     if (!name || !String(name).trim()) errors.push('name is required');
@@ -80,11 +70,8 @@ function validatePatientPayload(body, isCreate = true) {
   const dobErr = validateDob(dob);
   if (dobErr) errors.push(dobErr);
 
-  if (status !== undefined) {
-    const s = String(status).toUpperCase();
-    if (!['ACTIVE', 'DEACTIVATED', 'ARCHIVED'].includes(s)) {
-      errors.push("status must be one of 'ACTIVE','DEACTIVATED','ARCHIVED'");
-    }
+  if (archived !== undefined && typeof archived !== 'boolean') {
+    errors.push('archived must be boolean when provided');
   }
 
   return errors;
@@ -109,7 +96,7 @@ async function initializeServer() {
       .json({ ok: true, uptime: process.uptime() })
   );
 
-  // Login (issues JWT for first grouping policy found)
+  // Login
   app.get('/login/:userId', async (req, res) => {
     try {
       const userId = req.params.userId;
@@ -129,7 +116,7 @@ async function initializeServer() {
     }
   });
 
-  // SIGNUP: bind user->role@domain and ensure policies exist (idempotent)
+  // SIGNUP (bind user->role@domain + ensure read/write policies exist)
   app.post('/api/v6/signup/clinic', async (req, res) => {
     try {
       const { newUserId, newClinicId, newRole } = req.body || {};
@@ -146,7 +133,7 @@ async function initializeServer() {
     }
   });
 
-  // Patients: READ (paginated; defaults to ACTIVE)
+  // Patients: READ (paginated, archived=false by default; includeArchived=true to include)
   app.get('/clinics/:clinicId/patients', auth, async (req, res) => {
     try {
       const userId = req.auth.sub;
@@ -156,45 +143,31 @@ async function initializeServer() {
 
       const page = Math.max(1, Number(req.query.page) || 1);
       const pageSize = Math.min(50, Math.max(1, Number(req.query.pageSize) || 10));
+      const includeArchived = String(req.query.includeArchived || 'false').toLowerCase() === 'true';
       const offset = (page - 1) * pageSize;
-      const statusFilter = (req.query.status || 'ACTIVE').toString().toUpperCase();
 
-      const sql =
-        `SELECT patient_id, clinic_domain_id, owner_user_id, name, species, breed, dob, status, created_at
-         FROM patients
-         WHERE clinic_domain_id = $1 AND status = $2
-         ORDER BY created_at DESC
-         LIMIT $3 OFFSET $4`;
+      let sql =
+        `SELECT patient_id, clinic_domain_id, owner_user_id, name, species, breed, dob, archived, created_at
+           FROM patients
+          WHERE clinic_domain_id = $1`;
+      const params = [clinicId];
 
-      const { rows } = await dbPool.query(sql, [clinicId, statusFilter, pageSize, offset]);
+      if (!includeArchived) {
+        sql += ` AND archived = false`;
+      }
+
+      sql += ` ORDER BY created_at DESC LIMIT $2 OFFSET $3`;
+      params.push(pageSize, offset);
+
+      const { rows } = await dbPool.query(sql, params);
       return res.json({ items: rows, page, pageSize });
     } catch (err) {
-      // Fallback if status column were missing (defensive)
-      if (err && err.code === '42703' && /status/i.test(err.message)) {
-        try {
-          const page = Math.max(1, Number(req.query.page) || 1);
-          const pageSize = Math.min(50, Math.max(1, Number(req.query.pageSize) || 10));
-          const offset = (page - 1) * pageSize;
-          const clinicId = req.params.clinicId;
-          const fallback =
-            `SELECT patient_id, clinic_domain_id, owner_user_id, name, species, breed, dob, created_at
-             FROM patients
-             WHERE clinic_domain_id = $1
-             ORDER BY created_at DESC
-             LIMIT $2 OFFSET $3`;
-          const { rows } = await dbPool.query(fallback, [clinicId, pageSize, offset]);
-          return res.json({ items: rows, page, pageSize, warning: 'status_column_missing' });
-        } catch (e2) {
-          console.error('Error in GET patients (fallback):', e2);
-          return res.status(500).json({ error: 'Internal server error' });
-        }
-      }
       console.error('Error in GET patients:', err);
       return res.status(500).json({ error: 'Internal server error' });
     }
   });
 
-  // Patients: CREATE (defaults to ACTIVE)
+  // Patients: CREATE
   app.post('/clinics/:clinicId/patients', auth, async (req, res) => {
     try {
       const userId = req.auth.sub;
@@ -205,14 +178,12 @@ async function initializeServer() {
       const errors = validatePatientPayload(req.body, true);
       if (errors.length) return res.status(400).json({ errors });
 
-      const { name, species, breed, dob, status } = req.body;
-      const normalizedStatus = (status ? String(status).toUpperCase() : 'ACTIVE');
-
+      const { name, species, breed, dob } = req.body;
       const { rows } = await dbPool.query(
-        `INSERT INTO patients (clinic_domain_id, owner_user_id, name, species, breed, dob, status)
-         VALUES ($1, NULL, $2, $3, $4, $5, $6)
-         RETURNING patient_id, clinic_domain_id, owner_user_id, name, species, breed, dob, status, created_at`,
-        [clinicId, name?.trim(), species?.trim(), (breed ?? '').trim() || null, dob || null, normalizedStatus]
+        `INSERT INTO patients (clinic_domain_id, owner_user_id, name, species, breed, dob, archived)
+         VALUES ($1, NULL, $2, $3, $4, $5, false)
+         RETURNING patient_id, clinic_domain_id, owner_user_id, name, species, breed, dob, archived, created_at`,
+        [clinicId, name?.trim(), species?.trim(), (breed ?? '').trim() || null, dob || null]
       );
       return res.status(201).json({ patient: rows[0] });
     } catch (err) {
@@ -221,7 +192,7 @@ async function initializeServer() {
     }
   });
 
-  // Patients: UPDATE (PATCH) — supports setting status to DEACTIVATED/ARCHIVED
+  // Patients: UPDATE (PATCH) — supports archived true/false
   app.patch('/clinics/:clinicId/patients/:patientId', auth, async (req, res) => {
     try {
       const userId = req.auth.sub;
@@ -233,32 +204,46 @@ async function initializeServer() {
       const errors = validatePatientPayload(req.body, false);
       if (errors.length) return res.status(400).json({ errors });
 
-      const allowed = { name: 'name', species: 'species', breed: 'breed', ownerUserId: 'owner_user_id', dob: 'dob', status: 'status' };
       const fields = [];
       const values = [];
-      let i = 1;
+      const allowed = {
+        name: 'name',
+        species: 'species',
+        breed: 'breed',
+        ownerUserId: 'owner_user_id',
+        dob: 'dob',
+        archived: 'archived',
+      };
 
+      let i = 1;
       for (const [key, col] of Object.entries(allowed)) {
         if (req.body[key] !== undefined) {
-          let value = req.body[key];
-          if (typeof value === 'string') value = value.trim();
-          if (value === '') value = null;
-          if (key === 'status' && value) value = String(value).toUpperCase();
           fields.push(`${col} = $${i++}`);
+          let value = req.body[key];
+
+          if (key === 'archived') {
+            value = Boolean(value);
+          }
+          if (typeof value === 'string') {
+            value = value.trim();
+            if (value === '') value = null;
+          }
+
           values.push(value);
         }
       }
 
       if (fields.length === 0) return res.status(400).json({ error: 'No updatable fields provided.' });
 
-      values.push(clinicId);
-      values.push(patientId);
+      values.push(clinicId);  // $i
+      values.push(patientId); // $i+1
 
-      const sql =
-        `UPDATE patients
+      const sql = `
+        UPDATE patients
            SET ${fields.join(', ')}
-         WHERE clinic_domain_id = $${i++} AND patient_id = $${i}
-         RETURNING patient_id, clinic_domain_id, owner_user_id, name, species, breed, dob, status, created_at`;
+         WHERE clinic_domain_id = $${i} AND patient_id = $${i + 1}
+         RETURNING patient_id, clinic_domain_id, owner_user_id, name, species, breed, dob, archived, created_at
+      `;
 
       const { rows } = await dbPool.query(sql, values);
       if (rows.length === 0) return res.status(404).json({ error: 'Patient not found' });
@@ -269,32 +254,12 @@ async function initializeServer() {
     }
   });
 
-  // Patients: "DELETE" -> Soft delete (archive) (NO hard delete)
-  app.delete('/clinics/:clinicId/patients/:patientId', auth, async (req, res) => {
-    try {
-      const userId = req.auth.sub;
-      const clinicId = req.params.clinicId;
-      const patientId = req.params.patientId;
-      const canWrite = await requireAccess(enforcer, userId, clinicId, 'patient_data', 'write');
-      if (!canWrite) return res.status(403).json({ error: 'Forbidden' });
-
-      const { rows } = await dbPool.query(
-        `UPDATE patients
-            SET status = 'ARCHIVED'
-          WHERE clinic_domain_id = $1 AND patient_id = $2
-          RETURNING patient_id`,
-        [clinicId, patientId]
-      );
-
-      if (rows.length === 0) return res.status(404).json({ error: 'Patient not found' });
-      return res.json({ ok: true, archived: rows[0].patient_id });
-    } catch (err) {
-      console.error('Error in DELETE(patient=archive):', err);
-      return res.status(500).json({ error: 'Internal server error' });
-    }
+  // No hard DELETE: return 405
+  app.delete('/clinics/:clinicId/patients/:patientId', auth, (req, res) => {
+    return res.status(405).json({ error: 'Hard delete is disabled. Use PATCH { archived: true }.' });
   });
 
-  /* Unauthorized handler (express-jwt) */
+  // Unauthorized handler
   app.use((err, req, res, next) => {
     if (err && err.name === 'UnauthorizedError') {
       return res.status(401).json({ error: 'Invalid or expired token.' });
@@ -302,7 +267,7 @@ async function initializeServer() {
     return next(err);
   });
 
-  /* Start & graceful shutdown */
+  // Start & graceful shutdown
   const server = app.listen(PORT, () => {
     console.log(`Server is running at http://localhost:${PORT}`);
   });

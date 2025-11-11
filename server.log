@@ -1,0 +1,8 @@
+
+> my-secure-app@1.0.0 start
+> node index.js
+
+Connecting to PostgreSQL...
+casbin-pg-adapter: using mod.default.newAdapter(options)
+Enforcer loaded from database. Server is ready!
+Server is running at http://localhost:3001
